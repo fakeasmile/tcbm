@@ -36,9 +36,11 @@ local_files_only=True；模型仅从 --model_path 指定的本地目录加载，
 trust_remote_code 的 "remote" 是 transformers 术语，非联网行为）。
 
 用法（用户执行，本脚本不由 AI 运行）：
-  conda activate toxicnew
-  python scripts/build_b1_micro_concepts.py --model_path models/GLM-4-9B-Chat
-  # 后端可选 --backend transformers（默认）| vllm；小规模试跑加 --limit 20
+  conda activate toxic_env   # 服务器环境
+  python scripts/build_b1_micro_concepts.py --model_path /root/autodl-tmp/glm-4-9b-chat
+  # 默认后端 vllm（fscbm 项目验证过的 GLM-4-9B-chat 加载路径——该模型的旧版自定义
+  # 代码与新版 transformers 在加载路径上有已知不兼容，transformers 后端仅建议用于
+  # 原生格式模型）；小规模试跑加 --limit 20
 """
 from __future__ import annotations
 
@@ -138,12 +140,19 @@ def parse_args() -> argparse.Namespace:
     )
     ap.add_argument("--model_path", type=str, required=True,
                     help="本地 LLM 目录（如 models/GLM-4-9B-Chat），禁止远程下载")
-    ap.add_argument("--backend", type=str, default="transformers",
-                    choices=["transformers", "vllm"], help="推理后端")
+    ap.add_argument("--backend", type=str, default="vllm",
+                    choices=["vllm", "transformers"],
+                    help="推理后端。默认 vllm（fscbm 项目验证过的 GLM-4-9B-chat 加载路径，"
+                         "对老版自定义代码兼容）；transformers 仅建议用于原生格式模型")
     ap.add_argument("--device", type=str, default="auto",
                     help="transformers 后端设备：auto/cuda/cpu")
     ap.add_argument("--dtype", type=str, default="bfloat16",
                     choices=["bfloat16", "float16", "float32"])
+    ap.add_argument("--gpu_memory_utilization", type=float, default=0.85,
+                    help="vllm 后端 GPU 显存占用比例（对齐 fscbm 项目）")
+    ap.add_argument("--max_model_len", type=int, default=4096,
+                    help="vllm 后端最大序列长度。fscbm 用 1024，但本脚本 P1 为 4-shot "
+                         "提示词更长，取 4096 留足余量")
     ap.add_argument("--pool_path", type=str, default="data/concepts/sample_pool.json")
     ap.add_argument("--config", type=str, default="configs/dict_b.yaml",
                     help="超参配置文件（CLI 显式传参时以 CLI 为准）")
@@ -309,7 +318,8 @@ class LLMBackend:
     """统一 chat 批量推理接口：chat_batch(messages_list) -> list[str]。"""
 
     def __init__(self, model_path: str, backend: str, device: str, dtype: str,
-                 seed: int):
+                 seed: int, gpu_memory_utilization: float = 0.85,
+                 max_model_len: int = 4096):
         self.backend = backend
         self.model_path = str(Path(model_path).expanduser().resolve())
         if not Path(self.model_path).is_dir():
@@ -328,6 +338,22 @@ class LLMBackend:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
         if backend == "transformers":
+            # 旧版 chatglm 格式 + 新版 transformers 的已知加载不兼容（all_tied_weights_keys
+            # 等，出现在 from_pretrained 内部，无法在外部修补）——提前警告，推荐 vllm
+            cfg_path = Path(self.model_path) / "config.json"
+            mtype = ""
+            if cfg_path.is_file():
+                try:
+                    mtype = str(json.loads(cfg_path.read_text(encoding="utf-8"))
+                                .get("model_type", ""))
+                except (json.JSONDecodeError, OSError):
+                    pass
+            if mtype == "chatglm":
+                print("[警告] 旧版 chatglm 格式（GLM-4-9B-chat 原始分发）的自定义代码与"
+                      "新版 transformers 在模型加载路径上存在已知不兼容"
+                      "（如 all_tied_weights_keys 缺失），transformers 后端很可能失败。"
+                      "推荐 --backend vllm（fscbm 项目验证过的加载路径），"
+                      "或改用原生 glm4 格式的模型目录。仍继续尝试加载……")
             from transformers import AutoModelForCausalLM
             dt = {"bfloat16": torch.bfloat16, "float16": torch.float16,
                   "float32": torch.float32}[dtype]
@@ -350,10 +376,23 @@ class LLMBackend:
             try:
                 from vllm import LLM
             except ImportError as e:
-                raise RuntimeError("未安装 vllm，请用 --backend transformers 或安装 vllm") from e
+                raise RuntimeError(
+                    "未安装 vllm。GLM-4-9B-chat 这类旧版自定义代码模型在新版 "
+                    "transformers 后端存在加载不兼容（all_tied_weights_keys 等），"
+                    "fscbm 项目即用 vllm 加载该模型，请安装 vllm 后重试") from e
+            # 参数对齐 fscbm/scripts/generate_scbm_concept.py::load_vllm_model
+            # （同款 GLM-4-9B-chat 在本项目服务器上的已验证配置）；差异仅两处：
+            # max_model_len 1024→4096（本脚本 P1 为 4-shot 提示词，更长）、显式传 seed
             self.llm = LLM(model=self.model_path,
                            trust_remote_code=self.trust_remote_code,
-                           dtype=dtype, seed=seed)
+                           dtype="auto",
+                           gpu_memory_utilization=gpu_memory_utilization,
+                           enable_prefix_caching=True,
+                           max_model_len=max_model_len,
+                           max_num_seqs=64,
+                           max_num_batched_tokens=16384,
+                           seed=seed)
+            self._smoke_generate()
         else:  # pragma: no cover - argparse 已约束
             raise ValueError(f"未知后端: {backend}")
 
@@ -787,7 +826,9 @@ def main() -> int:
 
     t0 = time.time()
     llm = LLMBackend(args.model_path, args.backend, args.device, args.dtype,
-                     seed=int(pool.get("metadata", {}).get("seed", 729)))
+                     seed=int(pool.get("metadata", {}).get("seed", 729)),
+                     gpu_memory_utilization=args.gpu_memory_utilization,
+                     max_model_len=args.max_model_len)
 
     # Step1 P1
     records, p1_stats = run_p1(samples, llm, p1_cache, par, args.limit)
