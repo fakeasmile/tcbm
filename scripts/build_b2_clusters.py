@@ -382,13 +382,15 @@ def main() -> int:
         claimed = set()
         for nm, idxs in name_to_members.items():
             claimed.update(idxs)
-            if nm in used_names:  # 跨簇同名 → 合并（同名即同义，避免词典键冲突）
+            nm_norm = nm.replace(" ", "")
+            if nm_norm in used_names:  # 跨簇同名 → 合并（同名即同义，避免词典键冲突）
                 dup_names.append(nm)
-                target = next(m for m in macro_records if m["concept"] == nm)
+                target = next(m for m in macro_records
+                              if m["concept"].replace(" ", "") == nm_norm)
                 target["members"].extend(names[i] for i in idxs)
                 target["_src_rows"].extend(cluster_rows[i] for i in idxs)
                 continue
-            used_names.add(nm)
+            used_names.add(nm_norm)
             rows_sub = [cluster_rows[i] for i in idxs]
             macro_records.append({
                 "concept": nm,
@@ -414,6 +416,17 @@ def main() -> int:
     n_single_promoted = 0
     for i in sorted(unassigned):
         if cluster_rows[i]["freq"] >= tau:
+            nm_norm = names[i].replace(" ", "")
+            # 与已有宏概念同名（P3 命名可能恰好等于某个离群单概念）→ 合并，避免词典键冲突
+            if nm_norm in used_names:
+                dup_names.append(names[i])
+                target = next(m for m in macro_records
+                              if m["concept"].replace(" ", "") == nm_norm)
+                target["members"].append(names[i])
+                target["_src_rows"].append(cluster_rows[i])
+                print(f"[B2][合并] 单晋升概念 {names[i]} 与既有宏概念同名，"
+                      f"并入 {target['concept']}")
+                continue
             macro_records.append({
                 "concept": names[i],
                 "members": [names[i]],
@@ -422,6 +435,7 @@ def main() -> int:
                 "source": "single",
                 "_src_rows": [cluster_rows[i]],
             })
+            used_names.add(nm_norm)
             n_single_promoted += 1
         else:
             singleton_rows.append(cluster_rows[i])
