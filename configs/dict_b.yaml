@@ -62,3 +62,10 @@ b3:
   span_min_len: 2            # 过滤单字触发片段
   other_share_warn: 0.15     # "其它"占比告警阈值（方案 §5.1）
   def_max_len: 40            # 定义长度 lint（仅标记不删除）
+  # B4 追加参数（P6 仲裁与 F5 探针）
+  p6_temperature: 0.2
+  p6_top_p: 0.9
+  p6_max_new_tokens: 96
+  p6_retries: 2
+  f5_val_ratio: 0.2
+  f5_max_iter: 1000
