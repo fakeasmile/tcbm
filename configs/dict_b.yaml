@@ -1,0 +1,47 @@
+# 词典B构建超参数（方案：docs/词典B全自动构建方案.md）
+# 所有阶段共用；各阶段脚本读取本文件，CLI 参数可覆盖。
+
+b0:
+  quotas:            # 层 -> 配额
+    implicit: 600
+    explicit: 400
+    paraphrase: 200
+    offensive: 200
+    non_toxic: 400
+  min_len: 10
+  dedup_sim: 0.95
+  over_provision: 2.0
+  seed: 729
+
+b1:
+  # P1 微概念抽取
+  p1_temperature: 0.2
+  p1_top_p: 0.9
+  p1_max_new_tokens: 320
+  p1_batch_size: 8          # transformers 后端每次 generate 的样本数
+  p1_retries: 2             # JSON 解析失败重试次数（方案 §9.2）
+  concept_len_range: [2, 8] # 规范概念名长度（字），越界仅标记不删除
+  # P2 词性闸门
+  p2_batch_terms: 50        # 每次 LLM 词性判定的词条数（方案 §3.2）
+  p2_temperature: 0.2
+  p2_max_new_tokens: 1600
+  adj_flags_jieba: [a, ad, d]   # jieba 词性标记全部落在此集合 → 判为形容词侧
+
+b2:
+  min_cluster_freq: 2       # freq>=2 进聚类；freq=1 弃置存档 singleton_pool.json
+  umap_n_neighbors: 15
+  umap_min_dist: 0.0
+  umap_metric: cosine
+  hdbscan_min_cluster_size: 5
+  name_top_m: 15            # P3 取距质心最近 m 个成员做命名
+
+b4:
+  tau_freq: 5               # F4 池内触及样本数下限
+  f1_sim: 0.85              # F1 标签捷径相似度上限
+  f2_sim: 0.9               # F2 两两相似度上限
+  f3_jaccard: 0.95          # F3 触发样本重合度上限
+  tau_g: 0.30               # F5 线性探针 F1 下限
+  f6_zero_rate: 0.001       # F6 近全零阈值（0.1%）
+  f6_one_rate: 0.9          # F6 近全一阈值
+  k_max: 150                # B5 停止条件 k 上限
+  b5_activation_rate: 0.003 # B5 新增概念教师触发率下限（等价 5/1800）

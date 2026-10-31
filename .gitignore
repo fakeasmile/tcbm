@@ -1,0 +1,75 @@
+```
+# Dependencies
+node_modules/
+
+# Environment
+.env
+.env.local
+*.env.*
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.venv/
+.venv.bak/
+pip-log.txt
+pip-delete-this-directory.txt
+.tox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.log
+*.pot
+*.pyc
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.hypothesis/
+
+# Build artifacts
+build/
+dist/
+*.egg
+*.egg-info/
+.eggs/
+.installed.cfg
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.whl
+develop-eggs/
+
+# IDE
+.idea/
+.vscode/
+
+# Models (large files)
+models/bert-base-chinese/
+models/Qwen2.5-*/
+models/DeepSeek-*/
+models/chinese-roberta-*/
+.trae/
+.workbuddy/
+.catpaw/
+docs/
+scripts/encode_tokens_qwen.py
+models/bge-*/
+models/Qwen3.5-*/
+
+# Data & Experiments
+data/
+experiments/
+experiments_*/
+/_*.txt
+```
