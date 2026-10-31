@@ -342,20 +342,28 @@ def run_p5(concepts: list[str], defs: dict[str, str], llm: LLMBackend,
 # ---------------------------------------------------------------------------
 
 def write_review(path: Path, macros: list[dict], defs: dict[str, str],
-                 cats: dict[str, dict], par: dict, stats: dict) -> None:
-    """b3_review.md：§8 审定点 2 的只读材料。"""
+                 cats: dict[str, dict], par: dict,
+                 style_flags: list[tuple[str, str]]) -> None:
+    """b3_review.md：§8 审定点 2 的只读材料。
+    统计量直接从 defs/cats 现算，不依赖 main 的 stats 结构（避免键形漂移）。"""
     by_cat: dict[str, list[dict]] = {c: [] for c in CATEGORY_NAMES}
     for m in macros:
         c = m["concept"]
         if c in defs and c in cats:
             by_cat[cats[c]["category"]].append(m)
 
+    n_ok = len(defs)
+    n_p4_fail = len(macros) - len(defs)
+    n_p5_fallback = sum(1 for v in cats.values() if v.get("fallback"))
+    other_share = (sum(1 for v in cats.values() if v["category"] == "其它")
+                   / len(cats) if cats else 0.0)
+
     lines = ["# B3 类别体系冻结确认材料（只读审阅，§8 审定点 2）", ""]
-    lines.append(f"- 宏概念总数: {len(macros)} | 成功补全: {stats['n_ok']} | "
-                 f"P4 失败: {stats['n_p4_fail']} | P5 兜底: {stats['n_p5_fallback']}")
-    lines.append(f"- \"其它\"占比: {stats['other_share']:.1%} "
+    lines.append(f"- 宏概念总数: {len(macros)} | 成功补全: {n_ok} | "
+                 f"P4 失败: {n_p4_fail} | P5 兜底: {n_p5_fallback}")
+    lines.append(f"- \"其它\"占比: {other_share:.1%} "
                  f"(告警阈值 {par['other_share_warn']:.0%} → "
-                 f"{'⚠️ 触发体系修订检查' if stats['other_share'] > par['other_share_warn'] else '未触发'})")
+                 f"{'⚠️ 触发体系修订检查' if other_share > par['other_share_warn'] else '未触发'})")
     lines.append("")
     lines.append("| 类别 | 数量 | 概念（按 freq_agg 降序，最多 20） |")
     lines.append("|---|---|---|")
@@ -383,7 +391,7 @@ def write_review(path: Path, macros: list[dict], defs: dict[str, str],
     lines.append("")
     lines.append("## 定义风格 lint（>40 字或含循环句式，仅标记不删除）")
     lines.append("")
-    flags = stats.get("def_style_flags", [])
+    flags = style_flags
     if flags:
         for c, why in flags:
             lines.append(f"- {c}: {why}（定义: {defs[c]}）")
@@ -509,7 +517,7 @@ def main() -> int:
     (out_dir / "b3_stats.json").write_text(
         json.dumps(stats, ensure_ascii=False, indent=1), encoding="utf-8")
 
-    write_review(out_dir / "b3_review.md", macros, defs, cats, par, stats)
+    write_review(out_dir / "b3_review.md", macros, defs, cats, par, style_flags)
 
     bar.update(1)
     bar.set_postfix_str("完成")
