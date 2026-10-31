@@ -819,7 +819,7 @@ def main() -> int:
             for j, nm in enumerate(kept):
                 bi = int(np.argmax(sim_nk[j]))
                 if float(sim_nk[j, bi]) > float(par["merge_sim"]):
-                    merged[dict_names[bi]].append(nm)
+                    merged.setdefault(dict_names[bi], []).append(nm)
                 else:
                     standalone.append(nm)
         else:
