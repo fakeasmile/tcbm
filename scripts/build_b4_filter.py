@@ -16,8 +16,10 @@ build_b4_filter.py — 词典B构建 · B4 六规则过滤
          池内 5 次 ≈ 全 train 27 次量级）。
   Step6  F5 线性可辨识度（CT-CBM g(c) 判据）：标签 = 该概念 text_span 是否
          出现在池样本中（样本级自动弱标签，非人工标注）；bge-m3 嵌入 +
-         线性探针（逻辑回归，class_weight=balanced），8:2 分层划分，
-         验证集 F1 < tau_g(0.30) → 删；验证集单类/无正例 → 跳过探针保留并标记。
+         线性探针（逻辑回归，class_weight=balanced）。评估用 5 折分层交叉
+         验证取均值 F1（单次划分在低正例场景下方差过大，0.000 可能只是
+         漏掉验证集里唯一的正例），均值 F1 < tau_g(0.30) → 删；
+         正例 < 折数或折内无正例 → 跳过探针保留并标记。
   Step7  F6 近常数：触发率 < 0.1%（近全零）或 > 90%（近全一）→ 删。
   Step8  落盘：B_dict_final.csv + filter_report.md（逐条删除/合并证据，
          含词典级诊断：触发率基尼系数）+ b4_stats.json。
@@ -152,7 +154,7 @@ def resolve_params(args: argparse.Namespace, cfg: dict) -> dict:
         # F1 标签词
         "f1_label_words": DEFAULT_LABEL_WORDS,
         # F5 探针
-        "f5_val_ratio": 0.2,
+        "f5_n_folds": 5,
         "f5_max_iter": 1000,
         # P6 仲裁
         "p6_temperature": 0.2,
@@ -439,12 +441,13 @@ def main() -> int:
     # ---- Step6 F5 线性可辨识度 ----
     from sklearn.linear_model import LogisticRegression
     from sklearn.metrics import f1_score
-    from sklearn.model_selection import train_test_split
+    from sklearn.model_selection import StratifiedKFold
 
     f5_list = sorted(keep)
     bar.total += len(f5_list)
     bar.refresh()
     idx = np.arange(n_pool)
+    n_splits = int(par["f5_n_folds"])
     n_f5_del = 0
     n_f5_skip = 0
     for c in f5_list:
@@ -456,36 +459,38 @@ def main() -> int:
             bar.update(1)
             continue
         y = np.array([any(sp in t for sp in span_set) for t in texts])
-        if y.sum() < 2 or y.sum() >= n_pool - 1:
+        if y.sum() < n_splits or y.sum() >= n_pool - 1:
             states[c].f5_status = "跳过(正例过少/近全一)"
             n_f5_skip += 1
             bar.update(1)
             continue
-        try:
-            # 按概念标签分层 8:2 划分（低频概念正例少，必须 stratify）
-            tr_idx, va_idx = train_test_split(
-                idx, test_size=float(par["f5_val_ratio"]),
-                random_state=seed, stratify=y)
-        except ValueError:
-            states[c].f5_status = "跳过(验证集单类)"
+        # 5 折分层交叉验证：单次划分在低正例场景下方差过大，
+        # 均值 F1 才是"线性可辨识度"的稳定估计
+        skf = StratifiedKFold(n_splits=n_splits, shuffle=True,
+                              random_state=seed)
+        fold_f1: list[float] = []
+        for tr_idx, va_idx in skf.split(idx, y):
+            if y[va_idx].sum() == 0:
+                continue
+            clf = LogisticRegression(max_iter=int(par["f5_max_iter"]),
+                                     class_weight="balanced",
+                                     random_state=seed)
+            clf.fit(text_emb[tr_idx], y[tr_idx])
+            fold_f1.append(float(f1_score(y[va_idx],
+                                          clf.predict(text_emb[va_idx]))))
+        if len(fold_f1) < max(2, n_splits - 1):
+            states[c].f5_status = "跳过(有效折不足)"
             n_f5_skip += 1
             bar.update(1)
             continue
-        if y[va_idx].sum() == 0:
-            states[c].f5_status = "跳过(验证集无正例)"
-            n_f5_skip += 1
-            bar.update(1)
-            continue
-        clf = LogisticRegression(max_iter=int(par["f5_max_iter"]),
-                                 class_weight="balanced", random_state=seed)
-        clf.fit(text_emb[tr_idx], y[tr_idx])
-        f1 = float(f1_score(y[va_idx], clf.predict(text_emb[va_idx])))
+        f1 = float(np.mean(fold_f1))
         states[c].f5_f1 = round(f1, 4)
         states[c].f5_status = "probe"
         if f1 < float(par["tau_g"]):
             delete_log.append({"concept": c, "rule": "F5线性探针",
-                               "evidence": f"val_F1={f1:.3f}<{par['tau_g']} "
-                                           f"(正例 {int(y.sum())}/{n_pool})"})
+                               "evidence": f"CV均值F1={f1:.3f}<{par['tau_g']} "
+                                           f"(正例 {int(y.sum())}/{n_pool}, "
+                                           f"有效折 {len(fold_f1)})"})
             n_f5_del += 1
         bar.update(1)
     keep -= {d["concept"] for d in delete_log if d["rule"] == "F5线性探针"}

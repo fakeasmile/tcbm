@@ -67,5 +67,5 @@ b3:
   p6_top_p: 0.9
   p6_max_new_tokens: 96
   p6_retries: 2
-  f5_val_ratio: 0.2
+  f5_n_folds: 5              # F5 探针分层交叉验证折数
   f5_max_iter: 1000
