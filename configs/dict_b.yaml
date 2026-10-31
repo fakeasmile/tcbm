@@ -69,3 +69,29 @@ b3:
   p6_retries: 2
   f5_n_folds: 5              # F5 探针分层交叉验证折数
   f5_max_iter: 1000
+
+b5:
+  # 判据与停止条件（方案 §7.1/§7.3）
+  sat_gain: 0.005            # 一致率饱和增益阈值（0.5pp），总体与隐式同时判定
+  survival_min: 0.2          # 连续 2 轮存活率低于此值且已迭代 >=2 轮 → 停
+  max_rounds: 8              # 安全轮数上限
+  # P7 挖缺
+  p7_top: 200                # 每轮取两教师余弦距离最大的样本数
+  p7_batch: 10               # 每次 P7 调用分析的样本数
+  p7_temperature: 0.3
+  p7_top_p: 0.9
+  p7_max_new_tokens: 600
+  p7_retries: 2
+  # 单点归簇
+  merge_sim: 0.75            # 与最近宏概念 cos 超过则并入
+  # F4' 教师激活率（等价 F4 的 5/1800）
+  f4p_rate: 0.003
+  # LLM-c / LLM-k 打分
+  llm_c_batch: 32
+  score_temperature: 0.0
+  score_top_p: 1.0
+  score_max_new_tokens: 256
+  score_retries: 2
+  text_max_chars: 160
+  examples_top: 5            # LLM-c 提示词中各类别典型成员数
+  plm_max_iter: 1000
