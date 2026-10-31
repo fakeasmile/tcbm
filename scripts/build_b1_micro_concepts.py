@@ -605,10 +605,16 @@ def run_p1(samples: list[dict], llm: LLMBackend, cache: JsonlCache,
 # Step2：P2 词性闸门
 # ---------------------------------------------------------------------------
 
+VALID_POS_LLM = {"名词", "动名词", "形容词", "副词", "其它"}
+
 
 def run_p2_llm(terms: list[str], llm: LLMBackend, cache: JsonlCache,
                par: dict) -> dict[str, str]:
-    """返回 term -> pos（名词/动名词/形容词/副词/其它；两轮重试后仍失败的 term 不在返回字典中）。"""
+    """返回 term -> pos（名词/动名词/形容词/副词/其它；两轮重试后仍失败的 term 不在返回字典中）。
+
+    缓存口径：per-term 直接缓存解析后的词性字符串（写读一致；历史版本曾按原始
+    JSON 存储，读回时做向后兼容解析）。
+    """
 
     def query_chunk(chunk: list[str]) -> None:
         terms_json = json.dumps(chunk, ensure_ascii=False)
@@ -618,11 +624,17 @@ def run_p2_llm(terms: list[str], llm: LLMBackend, cache: JsonlCache,
         raws = llm.chat_batch(msgs, par["p2_temperature"], par["p2_top_p"],
                               par["p2_max_new_tokens"], 1, desc="P2词性LLM")
         obj = extract_json(raws[0])
+        # 归一键匹配：模型回显词条可能带空格/引号等噪音，按去空格后的键对齐
+        norm = {t.replace(" ", "").strip(): t for t in chunk}
         got: dict[str, str] = {}
         if isinstance(obj, dict) and isinstance(obj.get("results"), list):
             for it in obj["results"]:
-                if isinstance(it, dict) and str(it.get("term", "")).strip():
-                    got[str(it["term"]).strip()] = str(it.get("pos", "其它")).strip()
+                if not isinstance(it, dict):
+                    continue
+                key = str(it.get("term", "")).replace(" ", "").strip()
+                pos = str(it.get("pos", "")).strip()
+                if key in norm and pos in VALID_POS_LLM:
+                    got[norm[key]] = pos
         # 只缓存成功判定且命中请求词条的项；缺失项进入重试轮（不缓存失败）
         for t in chunk:
             if t in got:
@@ -640,21 +652,23 @@ def run_p2_llm(terms: list[str], llm: LLMBackend, cache: JsonlCache,
         for start in range(0, len(missing), bs):
             query_chunk(missing[start:start + bs])
 
-    # 读回：从缓存原始文本中解析出每个词条的词性
-    out = {}
+    # 读回：缓存值即词性字符串；兼容历史原始 JSON 口径
+    out: dict[str, str] = {}
     for t in terms:
         raw = cache.get(t)
         if raw is None:
             continue
-        obj = extract_json(raw)
-        pos = None
+        if raw in VALID_POS_LLM:          # 当前口径：直接是词性字符串
+            out[t] = raw
+            continue
+        obj = extract_json(raw)            # 历史口径：原始 JSON，检索本词条
         if isinstance(obj, dict) and isinstance(obj.get("results"), list):
             for it in obj["results"]:
-                if isinstance(it, dict) and str(it.get("term", "")).strip() == t:
-                    pos = str(it.get("pos", "")).strip()
+                if isinstance(it, dict) and \
+                        str(it.get("term", "")).replace(" ", "").strip() == t \
+                        and str(it.get("pos", "")).strip() in VALID_POS_LLM:
+                    out[t] = str(it["pos"]).strip()
                     break
-        if pos:
-            out[t] = pos
     return out
 
 
@@ -679,9 +693,18 @@ def pos_gate(concepts: list[str], llm: LLMBackend, p2_cache: JsonlCache,
     {pos_llm, seg_adjish, seg_flags, decision: keep|deleted_pos, conflict: bool}
     """
     pos_map = run_p2_llm(concepts, llm, p2_cache, par)
+    n_llm_ok = len(pos_map)
+    if n_llm_ok == 0:
+        print("[B1][P2][警告] LLM 词性通道零覆盖——闸门将完全依赖 jieba 单通道。"
+              "若非预期，请检查 p2_pos_cache.jsonl 中模型的原始输出格式")
+    elif n_llm_ok < len(concepts):
+        print(f"[B1][P2] LLM 词性通道覆盖 {n_llm_ok}/{len(concepts)}，"
+              f"缺失词条按 jieba 结果处理")
     adj_flags = set(par["adj_flags_jieba"])
     decisions: dict[str, dict] = {}
     stats = Counter()
+    stats["llm_ok"] = n_llm_ok
+    stats["llm_missing"] = len(concepts) - n_llm_ok
     for t in concepts:
         pos_llm = pos_map.get(t)  # None = LLM 通道失败
         seg_adjish, seg_flags = jieba_pos_flags(t, adj_flags)
