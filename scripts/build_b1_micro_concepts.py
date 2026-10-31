@@ -322,6 +322,7 @@ class LLMBackend:
                  max_model_len: int = 4096):
         self.backend = backend
         self.model_path = str(Path(model_path).expanduser().resolve())
+        self.max_model_len = int(max_model_len)   # 调用方按此估算 prompt 预算
         if not Path(self.model_path).is_dir():
             raise FileNotFoundError(f"模型目录不存在: {self.model_path}")
         self.trust_remote_code = preflight_remote_code(self.model_path)

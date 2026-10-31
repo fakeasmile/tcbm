@@ -93,7 +93,8 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--dtype", type=str, default="bfloat16",
                     choices=["bfloat16", "float16", "float32"])
     ap.add_argument("--gpu_memory_utilization", type=float, default=0.85)
-    ap.add_argument("--max_model_len", type=int, default=4096)
+    ap.add_argument("--max_model_len", type=int, default=16384,
+                    help="vLLM 序列上限；B5 概念清单含定义，4096 不够")
     ap.add_argument("--train_input", type=str,
                     default="data/raw/TOXICN/train.json")
     ap.add_argument("--pool_input", type=str,
@@ -425,7 +426,11 @@ def llm_c_scores(llm: LLMBackend, texts: list[str], examples: dict,
 def build_llm_k_messages(text: str, concepts: list[dict],
                          max_chars: int) -> list[dict]:
     t = text[:max_chars]
-    c_json = json.dumps(concepts, ensure_ascii=False)
+    # 定义截断到 60 字（B3 lint 最长 69 字），防概念清单膨胀顶爆上下文
+    c_json = json.dumps(
+        [{"concept": c["concept"],
+          "definition": str(c.get("definition", ""))[:60]} for c in concepts],
+        ensure_ascii=False)
     user = (
         "对下列文本，逐一判断它与每个概念的关联程度。等级定义：\n"
         "1=完全不相关；2=文本提及/涉及该概念；3=文本在使用/体现该概念实施行为。\n"
@@ -442,70 +447,113 @@ def build_llm_k_messages(text: str, concepts: list[dict],
 def llm_k_scores(llm: LLMBackend, texts: list[str], concepts: list[dict],
                  cache: JsonlCache, par: dict,
                  on_progress=None) -> np.ndarray:
-    """池样本 × 新概念三级打分 → (n, len(concepts)) int(1-3)。"""
+    """池样本 × 新概念三级打分 → (n, len(concepts)) int(1-3)。
+
+    概念清单按上下文预算自动分块：逐概念独立打分，分块语义无损；
+    分数按列合并。缓存键 = 文本前缀 + 块内概念名 md5——单块情形与
+    旧版键一致（旧缓存不失效）。
+    """
     n_cat = len(concepts)
     if n_cat == 0:
         return np.zeros((len(texts), 0), dtype=np.int8)
     levels = np.ones((len(texts), n_cat), dtype=np.int8)
-    ckey = md5(json.dumps([c["concept"] for c in concepts],
-                          ensure_ascii=False))
-    keys = [md5(t[:par["text_max_chars"]] + "\x1f" + ckey) for t in texts]
-    todo: list[int] = []
-    for i, k in enumerate(keys):
-        raw = cache.get(k)
+
+    # ---- 按上下文预算分块（中文保守按 1 token≈1.2 字估算）----
+    max_len = int(getattr(llm, "max_model_len", 0) or 4096)
+    budget_tokens = max_len - int(par["score_max_new_tokens"]) - 256
+    budget_chars = max(int(budget_tokens * 1.2), 800)
+    fixed_chars = 320 + 2 * int(par["text_max_chars"])  # 指令+文本+回显JSON壳
+
+    def _w(c: dict) -> int:
+        return len(c["concept"]) + min(len(str(c.get("definition", ""))), 60) + 20
+
+    chunks: list[list[dict]] = []
+    gidx: list[list[int]] = []            # 块内列号 → 全局列号
+    cur: list[dict] = []
+    cur_idx: list[int] = []
+    cur_chars = 0
+    for j, c in enumerate(concepts):
+        w = _w(c)
+        if cur and cur_chars + w + 40 > budget_chars - fixed_chars:
+            chunks.append(cur)
+            gidx.append(cur_idx)
+            cur, cur_idx, cur_chars = [], [], 0
+        cur.append(c)
+        cur_idx.append(j)
+        cur_chars += w
+    if cur:
+        chunks.append(cur)
+        gidx.append(cur_idx)
+    n_chunks = len(chunks)
+    if n_chunks > 1:
+        print(f"[B5][LLM-k] 概念清单超单次上下文预算，分 {n_chunks} 块打分")
+
+    ckeys = [md5(json.dumps([c["concept"] for c in ch], ensure_ascii=False))
+             for ch in chunks]
+    tkeys = [[md5(t[:par["text_max_chars"]] + "\x1f" + ckeys[ci])
+              for ci in range(n_chunks)] for t in texts]
+
+    def _fill(i: int, ci: int, raw) -> bool:
         obj = extract_json(raw) if raw is not None else None
-        got = False
-        if isinstance(obj, dict) and isinstance(obj.get("scores"), dict):
-            lv = obj["scores"]
-            ok = True
-            for j, cd in enumerate(concepts):
-                v = lv.get(cd["concept"])
-                if isinstance(v, int) and v in (1, 2, 3):
-                    levels[i, j] = v
-                else:
-                    ok = False
-                    break
-            got = ok
-        if got:
+        if not (isinstance(obj, dict) and isinstance(obj.get("scores"), dict)):
+            return False
+        lv = obj["scores"]
+        for lj, cd in enumerate(chunks[ci]):
+            v = lv.get(cd["concept"])
+            if not (isinstance(v, int) and v in (1, 2, 3)):
+                return False
+            levels[i, gidx[ci][lj]] = v
+        return True
+
+    done = [[False] * n_chunks for _ in texts]
+    counted: set[int] = set()
+
+    def _maybe_count(i: int) -> None:
+        if i not in counted and all(done[i]):
+            counted.add(i)
             if on_progress:
                 on_progress()
-        else:
-            todo.append(i)
 
+    for i in range(len(texts)):
+        for ci in range(n_chunks):
+            if _fill(i, ci, cache.get(tkeys[i][ci])):
+                done[i][ci] = True
+        _maybe_count(i)
+
+    todo = [(i, ci) for i in range(len(texts))
+            for ci in range(n_chunks) if not done[i][ci]]
     bs = int(par["llm_c_batch"])
     for attempt in range(int(par["score_retries"]) + 1):
         if not todo:
             break
-        nxt: list[int] = []
+        nxt: list[tuple[int, int]] = []
         for st in range(0, len(todo), bs):
-            chunk = todo[st:st + bs]
-            msgs = [build_llm_k_messages(texts[i], concepts,
-                                         par["text_max_chars"]) for i in chunk]
+            batch = todo[st:st + bs]
+            msgs = [build_llm_k_messages(texts[i], chunks[ci],
+                                         par["text_max_chars"])
+                    for i, ci in batch]
             raws = llm.chat_batch(msgs, par["score_temperature"],
                                   par["score_top_p"],
                                   par["score_max_new_tokens"], bs,
                                   desc="LLM-k概念打分", progress=False)
-            for i, raw in zip(chunk, raws):
-                obj = extract_json(raw)
-                if isinstance(obj, dict) and isinstance(obj.get("scores"), dict):
-                    lv = obj["scores"]
-                    if all(isinstance(lv.get(cd["concept"]), int)
-                           and lv[cd["concept"]] in (1, 2, 3)
-                           for cd in concepts):
-                        for j, cd in enumerate(concepts):
-                            levels[i, j] = lv[cd["concept"]]
-                        cache.put(keys[i], raw)
-                        if on_progress:
-                            on_progress()
-                        continue
-                nxt.append(i)
+            for (i, ci), raw in zip(batch, raws):
+                if _fill(i, ci, raw):
+                    done[i][ci] = True
+                    cache.put(tkeys[i][ci], raw)
+                else:
+                    nxt.append((i, ci))
+            for i, _ci in batch:
+                _maybe_count(i)
         todo = nxt
         if todo:
-            print(f"[B5][LLM-k][警告] {len(todo)} 条解析失败，重试 "
+            print(f"[B5][LLM-k][警告] {len(todo)} 条(×块)解析失败，重试 "
                   f"{attempt + 1}/{par['score_retries']}")
-    for i in todo:
-        if on_progress:
-            on_progress()
+    # 兜底：始终未完成（多次解析失败）的文本也消耗进度单元
+    for i in range(len(texts)):
+        if i not in counted:
+            counted.add(i)
+            if on_progress:
+                on_progress()
     return levels
 
 
