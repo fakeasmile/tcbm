@@ -46,3 +46,19 @@ b4:
   f6_one_rate: 0.9          # F6 近全一阈值
   k_max: 150                # B5 停止条件 k 上限
   b5_activation_rate: 0.003 # B5 新增概念教师触发率下限（等价 5/1800）
+
+b3:
+  # P4 定义生成
+  p4_temperature: 0.2
+  p4_top_p: 0.9
+  p4_max_new_tokens: 256     # 40 字定义 + JSON 壳，256 充裕
+  # P5 类别归类
+  p5_temperature: 0.2
+  p5_top_p: 0.9
+  p5_max_new_tokens: 128     # {"category": "...", "confidence": "高"} 很短
+  retries: 2                 # JSON 解析失败重试次数（方案 §9 失败模式 2）
+  p4_batch_size: 16          # 每次 chat_batch 的概念数
+  n_spans: 20                # P4 证据片段条数上限
+  span_min_len: 2            # 过滤单字触发片段
+  other_share_warn: 0.15     # "其它"占比告警阈值（方案 §5.1）
+  def_max_len: 40            # 定义长度 lint（仅标记不删除）
