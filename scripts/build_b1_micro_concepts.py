@@ -425,21 +425,25 @@ class LLMBackend:
 
     def chat_batch(self, messages_list: list[list[dict]], temperature: float,
                    top_p: float, max_new_tokens: int, batch_size: int,
-                   desc: str = "") -> list[str]:
+                   desc: str = "", progress: bool = True) -> list[str]:
+        """progress=False 时不打印内置进度条（调用方用总进度条统一管理时使用）。"""
         if self.backend == "vllm":
-            return self._gen_vllm(messages_list, temperature, top_p, max_new_tokens)
+            return self._gen_vllm(messages_list, temperature, top_p,
+                                  max_new_tokens, progress)
         return self._gen_transformers(messages_list, temperature, top_p,
-                                      max_new_tokens, batch_size, desc)
+                                      max_new_tokens, batch_size, desc, progress)
 
     def _gen_transformers(self, messages_list, temperature, top_p, max_new_tokens,
-                          batch_size, desc):
+                          batch_size, desc, progress=True):
         prompts = self._to_prompt_strings(messages_list)
         outs: list[str] = []
-        try:
-            from tqdm import tqdm
-            it = tqdm(range(0, len(prompts), batch_size), desc=desc, ncols=90)
-        except ImportError:  # pragma: no cover
-            it = range(0, len(prompts), batch_size)
+        it = range(0, len(prompts), batch_size)
+        if progress:
+            try:
+                from tqdm import tqdm
+                it = tqdm(it, desc=desc, ncols=90)
+            except ImportError:  # pragma: no cover
+                pass
         torch = self.torch
         for start in it:
             batch = prompts[start:start + batch_size]
@@ -461,12 +465,19 @@ class LLMBackend:
             outs.extend(t.strip() for t in texts)
         return outs
 
-    def _gen_vllm(self, messages_list, temperature, top_p, max_new_tokens):
+    def _gen_vllm(self, messages_list, temperature, top_p, max_new_tokens,
+                  progress=True):
         from vllm import SamplingParams
         prompts = self._to_prompt_strings(messages_list)
         sp = SamplingParams(temperature=temperature, top_p=top_p,
                             max_tokens=max_new_tokens, seed=None)
-        outs = self.llm.generate(prompts, sp)
+        if progress:
+            outs = self.llm.generate(prompts, sp)
+        else:
+            try:  # vllm >= 0.4 支持关闭内置进度条
+                outs = self.llm.generate(prompts, sp, use_tqdm=False)
+            except TypeError:
+                outs = self.llm.generate(prompts, sp)
         return [o.outputs[0].text.strip() for o in outs]
 
 

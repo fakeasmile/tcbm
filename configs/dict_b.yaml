@@ -22,9 +22,10 @@ b1:
   p1_retries: 2             # JSON 解析失败重试次数（方案 §9.2）
   concept_len_range: [2, 8] # 规范概念名长度（字），越界仅标记不删除
   # P2 词性闸门
-  p2_batch_terms: 50        # 每次 LLM 词性判定的词条数（方案 §3.2）
+  p2_batch_terms: 20        # 每次 LLM 词性判定的词条数。50 会导致回显 JSON 触及
+                            # p2_max_new_tokens 上限被截断（全量实测 llm_missing=47%）
   p2_temperature: 0.2
-  p2_max_new_tokens: 1600
+  p2_max_new_tokens: 1200   # 20 条 × ~25 token/条 ≈ 500，1200 留 2 倍余量
   adj_flags_jieba: [a, ad, d]   # jieba 词性标记全部落在此集合 → 判为形容词侧
 
 b2:

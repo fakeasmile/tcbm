@@ -182,19 +182,24 @@ class BGEM3Encoder:
         self.batch_size = batch_size
         print(f"[B0] 嵌入模型加载完成: {p} | device={device}")
 
-    def encode(self, texts: list[str], desc: str = "") -> np.ndarray:
+    def encode(self, texts: list[str], desc: str = "",
+               progress: bool = True) -> np.ndarray:
         """返回 (n, d) float32 的 L2 归一化 dense 向量。
+
+        progress=False 时不打印内置进度条（调用方用总进度条统一管理时使用）。
 
         注意：不用 @torch.no_grad() 装饰器——torch 为延迟导入，类定义时该名字
         尚不存在，装饰器会在模块导入期直接 NameError；改用方法内上下文管理器。
         """
         torch = self.torch
         vecs: list[np.ndarray] = []
-        try:
-            from tqdm import tqdm
-            it = tqdm(range(0, len(texts), self.batch_size), desc=desc, ncols=80)
-        except ImportError:  # tqdm 不可用时退化为静默进度
-            it = range(0, len(texts), self.batch_size)
+        it = range(0, len(texts), self.batch_size)
+        if progress:
+            try:
+                from tqdm import tqdm
+                it = tqdm(it, desc=desc, ncols=80)
+            except ImportError:  # tqdm 不可用时退化为静默进度
+                pass
         with torch.no_grad():
             for start in it:
                 batch = texts[start:start + self.batch_size]
