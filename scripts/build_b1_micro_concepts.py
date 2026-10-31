@@ -28,6 +28,13 @@ build_b1_micro_concepts.py — 词典B构建 · B1 微概念抽取
 复现性：温度 0.2 采样 + 固定种子（同版本模型/同硬件下近似可复现）；缓存命中部分与
 上次运行逐字节一致。断点续跑：P1/P2 缓存逐条落盘，中断后重跑只补缺失项。
 
+离线硬约束（红线）：全程禁止任何远程下载/在线调用——脚本启动即设置
+HF_HUB_OFFLINE=1 / TRANSFORMERS_OFFLINE=1，所有 from_pretrained 一律
+local_files_only=True；模型仅从 --model_path 指定的本地目录加载，任何文件缺失
+只明确报错、绝不联网。原生格式（model_type=glm4/glm）零自定义代码执行；
+旧版 chatglm 格式仅执行模型目录内的本地自定义代码（该代码随权重分发、存于本地，
+trust_remote_code 的 "remote" 是 transformers 术语，非联网行为）。
+
 用法（用户执行，本脚本不由 AI 运行）：
   conda activate toxicnew
   python scripts/build_b1_micro_concepts.py --model_path models/GLM-4-9B-Chat
@@ -37,11 +44,45 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import sys
 import time
 from collections import Counter
 from pathlib import Path
+
+# ---------------------------------------------------------------------------
+# 离线硬约束（先于一切 transformers 导入生效）
+# ---------------------------------------------------------------------------
+
+NATIVE_MODEL_TYPES = {"glm4", "glm"}  # transformers 原生支持的 GLM 格式（无需任何自定义代码）
+
+
+def enforce_offline() -> None:
+    """强离线保证：封死 HF/transformers 的一切网络访问暗道。
+
+    设置后，from_pretrained 在本地文件缺失时只会明确报错，绝不会尝试联网下载；
+    配合 local_files_only=True 双保险。红线：禁止任何远程下载/在线调用。
+    """
+    os.environ["HF_HUB_OFFLINE"] = "1"
+    os.environ["TRANSFORMERS_OFFLINE"] = "1"
+    os.environ["HF_DATASETS_OFFLINE"] = "1"
+
+
+def resolve_model_format(mp: Path) -> tuple[str, bool]:
+    """读取 config.json 判定模型格式。返回 (model_type, trust_remote_code)。
+
+    - 原生格式（glm4/glm）：transformers 内置实现，**不执行任何自定义 Python 代码**；
+    - 旧版 chatglm 格式：transformers 无内置实现，必须执行**模型目录内的本地**自定义
+      代码（trust_remote_code=True 术语辨析："remote" 指代码由模型作者随权重分发，
+      并存于本地模型目录，加载与执行均不联网）。
+    """
+    cfg_file = mp / "config.json"
+    if not cfg_file.is_file():
+        raise FileNotFoundError(f"模型目录缺少 config.json: {cfg_file}")
+    with open(cfg_file, encoding="utf-8") as f:
+        mt = (json.load(f) or {}).get("model_type", "")
+    return mt, mt not in NATIVE_MODEL_TYPES
 
 # ---------------------------------------------------------------------------
 # 常量：提示词（与方案文档 §3.1 / §3.2 逐字一致，不得随意改动）
@@ -201,6 +242,69 @@ def extract_json(text: str):
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# 远端代码预检与自愈（防 trust_remote_code 模型与新 transformers 的兼容问题）
+# ---------------------------------------------------------------------------
+
+
+def preflight_remote_code(model_path: str) -> bool:
+    """模型格式判定 + 预检 + 已知兼容问题自愈（fail fast）。返回是否执行本地自定义代码。
+
+    仅当模型为旧版 chatglm 格式（transformers 无内置实现）时才执行模型目录内的
+    本地自定义代码（trust_remote_code=True）；原生格式零自定义代码。
+    全程 local_files_only + 强离线环境变量，任何文件缺失只报错、不联网。
+    """
+    mp = Path(model_path).expanduser().resolve()
+    model_type, trust = resolve_model_format(mp)
+    print(f"[预检] model_type={model_type} | 自定义代码执行: "
+          f"{'是（仅模型目录内本地代码，全程离线）' if trust else '否（transformers 原生加载）'}"
+          f" | 离线模式: HF_HUB_OFFLINE=1")
+
+    if trust:
+        # 旧版 ChatGLM 远端（本地分发）代码在新 transformers 上的已知断裂点：
+        # config.max_length 已被移除 → 原地修补为 getattr 兜底（原文件备份 .bak，仅首次）
+        mfile = mp / "modeling_chatglm.py"
+        if mfile.is_file():
+            src = mfile.read_text(encoding="utf-8")
+            if "config.max_length" in src:
+                bak = mfile.with_name(mfile.name + ".bak")
+                if not bak.is_file():
+                    bak.write_text(src, encoding="utf-8")
+                patched = re.sub(
+                    r"config\.max_length\b",
+                    'getattr(config, "max_length", 8192)',
+                    src,
+                )
+                mfile.write_text(patched, encoding="utf-8")
+                print(f"[预检] 已修补本地模型代码的 config.max_length 兼容问题: {mfile}"
+                      f"（原文件备份: {bak.name}；8192 兜底对本任务短文本足够）")
+        # GLM 系本地分词代码依赖 tiktoken
+        if (mp / "tokenization_chatglm.py").is_file():
+            try:
+                import tiktoken  # noqa: F401
+            except ImportError as e:
+                raise RuntimeError(
+                    "该模型使用 GLM 本地分词代码（tokenization_chatglm.py），其依赖 "
+                    "tiktoken，当前环境未安装。请先执行: pip install tiktoken") from e
+
+    # chat 模板冒烟（本脚本用 apply_chat_template 构建全部提示）
+    from transformers import AutoTokenizer
+    tok = AutoTokenizer.from_pretrained(str(mp), trust_remote_code=trust,
+                                        local_files_only=True)
+    try:
+        s = tok.apply_chat_template(
+            [{"role": "user", "content": "你好"}],
+            tokenize=False, add_generation_prompt=True)
+    except Exception as e:
+        raise RuntimeError(
+            "tokenizer.apply_chat_template 不可用（模型目录未内置 chat 模板且模型代码"
+            "未提供兼容实现），本脚本依赖 chat 模板构建批量提示。"
+            f"原始错误: {e}") from e
+    if not s or "你好" not in s:
+        raise RuntimeError("chat 模板输出异常（未包含输入内容），请检查 tokenizer 配置")
+    return trust
+
+
 class LLMBackend:
     """统一 chat 批量推理接口：chat_batch(messages_list) -> list[str]。"""
 
@@ -210,13 +314,15 @@ class LLMBackend:
         self.model_path = str(Path(model_path).expanduser().resolve())
         if not Path(self.model_path).is_dir():
             raise FileNotFoundError(f"模型目录不存在: {self.model_path}")
+        self.trust_remote_code = preflight_remote_code(self.model_path)
         import torch
         self.torch = torch
         torch.manual_seed(seed)
 
         from transformers import AutoTokenizer
         self.tokenizer = AutoTokenizer.from_pretrained(
-            self.model_path, trust_remote_code=True)
+            self.model_path, trust_remote_code=self.trust_remote_code,
+            local_files_only=True)
         self.tokenizer.padding_side = "left"  # 批量生成必须左填充，显式设置防模板路径差异
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
@@ -228,15 +334,25 @@ class LLMBackend:
             if device == "auto":
                 device = "cuda" if torch.cuda.is_available() else "cpu"
             self.device = device
-            self.model = AutoModelForCausalLM.from_pretrained(
-                self.model_path, torch_dtype=dt, trust_remote_code=True,
-                device_map=None).to(self.device).eval()
+            try:  # transformers >= 4.56 用 dtype，旧版用 torch_dtype（已废弃）
+                self.model = AutoModelForCausalLM.from_pretrained(
+                    self.model_path, dtype=dt,
+                    trust_remote_code=self.trust_remote_code,
+                    local_files_only=True)
+            except TypeError:
+                self.model = AutoModelForCausalLM.from_pretrained(
+                    self.model_path, torch_dtype=dt,
+                    trust_remote_code=self.trust_remote_code,
+                    local_files_only=True)
+            self.model = self.model.to(self.device).eval()
+            self._smoke_generate()
         elif backend == "vllm":
             try:
                 from vllm import LLM
             except ImportError as e:
                 raise RuntimeError("未安装 vllm，请用 --backend transformers 或安装 vllm") from e
-            self.llm = LLM(model=self.model_path, trust_remote_code=True,
+            self.llm = LLM(model=self.model_path,
+                           trust_remote_code=self.trust_remote_code,
                            dtype=dtype, seed=seed)
         else:  # pragma: no cover - argparse 已约束
             raise ValueError(f"未知后端: {backend}")
@@ -247,6 +363,26 @@ class LLMBackend:
                                                add_generation_prompt=True)
             for msgs in messages_list
         ]
+
+    def _smoke_generate(self) -> None:
+        """加载后立即做一次最小生成（fail fast）：远端代码与 transformers 的
+        前向/Cache 等深层不兼容问题在启动 10 秒内暴露，而不是跑到批量推理中段才崩。"""
+        torch = self.torch
+        try:
+            outs = self.chat_batch(
+                [[{"role": "user", "content": "回复：OK"}]],
+                temperature=0.0, top_p=1.0, max_new_tokens=8,
+                batch_size=1, desc="smoke")
+        except Exception as e:
+            raise RuntimeError(
+                "模型加载后冒烟生成失败——通常是模型自带的本地自定义代码"
+                "（trust_remote_code）与当前 transformers 版本在生成路径上不兼容"
+                "（如 Cache 格式变更）。"
+                "可尝试: ① --backend vllm；② 为该环境安装与该代码同期版本的"
+                " transformers（如 pip install \"transformers==4.46.3\"）。"
+                f"原始错误: {e}") from e
+        if not outs or not outs[0]:
+            raise RuntimeError("冒烟生成返回空文本，请检查模型完整性")
 
     def chat_batch(self, messages_list: list[list[dict]], temperature: float,
                    top_p: float, max_new_tokens: int, batch_size: int,
@@ -621,11 +757,19 @@ def main() -> int:
     args = parse_args()
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8")
+    enforce_offline()  # 离线硬约束：先于一切 transformers/HF 导入生效
 
     cfg = load_cfg(args.config)
     par = resolve_params(args, cfg)
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    # jieba 依赖预检（P2 通道二依赖；缺失则启动即报错，不跑到中段才崩）
+    try:
+        import jieba  # noqa: F401
+    except ImportError:
+        print("[错误] 当前环境缺少 jieba（P2 词性通道二依赖）。请先执行: pip install jieba")
+        return 1
 
     # 1) 载入采样池
     with open(args.pool_path, encoding="utf-8") as f:
